@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.log
+xray.zip
+xray_bin/
+results*/
+all_found_links.txt
