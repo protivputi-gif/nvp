@@ -22,7 +22,7 @@
     pip install aiohttp rich PySocks
 
 Переменные окружения (необязательные):
-    VF_MAX_CONCURRENT   одновременных проверок (по умолчанию 30)
+    VF_MAX_CONCURRENT   одновременных проверок (по умолчанию 100)
     VF_LATENCY_SAMPLES  число замеров TCP-пинга (3)
     VF_MIN_SPEED        минимальная скорость Мбит/с для топ-файла (2.0)
     VF_TOP_N            сколько лучших нод сохранить (100)
@@ -329,7 +329,7 @@ class CheckConfig:
                                  # web.telegram.org через медленные ноды не успевают за один проход)
     SITE_TIMEOUT: float = 15.0
     SPEED_TEST_TIMEOUT: float = 30.0
-    MAX_CONCURRENT: int = _env_int("VF_MAX_CONCURRENT", 30)
+    MAX_CONCURRENT: int = _env_int("VF_MAX_CONCURRENT", 100)
     LATENCY_SAMPLES: int = _env_int("VF_LATENCY_SAMPLES", 3)
 
     # --- ускорение конвейера -------------------------------------------------
