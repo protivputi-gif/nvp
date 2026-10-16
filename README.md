@@ -4,11 +4,56 @@
 VLESS-нод. GitHub API-поиск **не используется** — только 11 публичных
 подписок, ссылки на них в списке `KNOWN_SUBSCRIPTION_URLS`.
 
+## Окружение и установка
+
+Требования: **Python 3.10+** (используются `X | None`-аннотации и asyncio-API
+этого поколения), Linux/macOS (скрипт POSIX-ориентированный), доступ в интернет.
+Зависимости: `aiohttp`, `rich`, `PySocks`. Бинарник `xray` ставится самим
+скриптом (`--install`) либо берётся из PATH.
+
+### Вариант 1 — venv (рекомендуется)
+
+```bash
+# создать окружение
+python3 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
+
+# зависимости
+pip install --upgrade pip
+pip install aiohttp rich PySocks
+
+# скачивать/проверить версию pip не обязательно, но полезно зафиксировать:
+pip freeze > requirements.txt      # опционально: для воспроизводимости
+```
+
+### Вариант 2 — conda
+
+```bash
+conda create -n vless-finder python=3.12 -y
+conda activate vless-finder
+pip install aiohttp rich PySocks
+```
+
+### Вариант 3 — системный Python без виртуального окружения
+
+```bash
+pip install --user aiohttp rich PySocks
+```
+
+### Проверка окружения
+
+```bash
+python -c "import aiohttp, rich, socks; print('deps OK')"   # должно напечатать: deps OK
+python vless_finder.py --version                            # версия скрипта
+python vless_finder.py --install                            # скачать xray в ./xray_bin
+./xray_bin/xray version                                     # убедиться, что бинарник рабочий
+```
+
+Деактивация окружения по окончании работы: `deactivate`.
+
 ## Быстрый старт
 
 ```bash
-pip install aiohttp rich PySocks
-
 # если бинарника xray нет рядом — скачать автоматически:
 python vless_finder.py --install
 
