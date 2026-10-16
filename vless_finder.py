@@ -24,6 +24,12 @@
     VF_MIN_SPEED        минимальная скорость Мбит/с для топ-файла (2.0)
     VF_TOP_N            сколько лучших нод сохранить (100)
     VF_EXTRA_SOURCES    доп. URL подписок через запятую
+    VF_PRECHECK         0 — отключить дешёвую разведку CONNECT перед полным
+                        циклом проверки (по умолчанию включена)
+    VF_PRECHECK_TIMEOUT таймаут разведки, сек (6.0)
+    VF_ADAPTIVE_SPEED   0 — качать тестовый файл всегда полным объёмом
+                        (по умолчанию адаптивный замер: быстрые ноды
+                        останавливаются на 2 МБ)
     XRAY_BINARY         путь к бинарнику xray
 """
 from __future__ import annotations
@@ -61,15 +67,35 @@ from rich.progress import (BarColumn, Progress, SpinnerColumn, TextColumn,
                            TimeElapsedColumn)
 from rich.table import Table
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 console = Console()
 
 
 # =============================================================================
 # 1. МОДЕЛИ ДАННЫХ  (бывш. models.py)
 # =============================================================================
+# Канонический формат UUID: 8-4-4-4-12 hex-символов.
 UUID_RE = re.compile(r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-"
                      r"[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
+
+
+def resolve_security(p: dict[str, str]) -> str:
+    """Единая точка резолвинга security для дедупликации и генератора конфига.
+
+    Раньше `security=auto` интерпретировался двумя разными способами:
+    effective_params() считал его TLS при наличии sni/fp/alpn, а билдер
+    конфига — plaintext без TLS-секции. Одна и та же нода дедуплицировалась
+    как TLS, а тестировалась как открытое соединение — расхождение давало
+    ложные вердикты. Теперь обе ветки вызывают эту функцию.
+    """
+    sec = (p.get("security") or "").strip().lower()
+    if not sec or sec == "auto":
+        if p.get("pbk") or p.get("public-key"):
+            return "reality"
+        if p.get("sni") or p.get("fp") or p.get("alpn"):
+            return "tls"
+        return "none"
+    return sec
 
 
 @dataclass
@@ -84,7 +110,8 @@ class VlessLink:
 
     @property
     def security(self) -> str:
-        return self.params.get("security", "none").lower()
+        """Эффективная security с учётом подразумеваемых значений."""
+        return resolve_security(self.params)
 
     @property
     def network(self) -> str:
@@ -132,15 +159,10 @@ class VlessLink:
         и одна нода проверяется несколько раз.
         """
         p = dict(self.params)
-        # security может быть не указан явно, но подразумеваться по sni/fp/alpn
-        sec = p.get("security", "").lower()
-        if not sec or sec == "auto":
-            if p.get("pbk") or p.get("public-key"):
-                sec = "reality"
-            elif p.get("sni") or p.get("fp") or p.get("alpn"):
-                sec = "tls"
-            else:
-                sec = "none"
+        # security нормализуется единой функцией resolve_security():
+        # значение по умолчанию, auto и подразумевание по sni/fp/alpn/pbk —
+        # тот же код, что использует генератор конфига xray
+        sec = resolve_security(p)
         net = p.get("type", "tcp").lower()
         net = {"websocket": "ws"}.get(net, net)
         eff = {
@@ -228,10 +250,26 @@ class NodeResult:
     bytes_downloaded: int = 0
     error: str = ""
     score: float = 0.0
+    # Стабильность (см. STABILITY_ROUNDS): round 0 — основной замер, далее
+    # контрольные раунды. списки равны по длине; элементы None = сбой раунда.
+    round_sites_ok: list[int] = field(default_factory=list)    # число сайтов в раунде
+    round_speed_mbps: list[float] = field(default_factory=list)
+    round_max_site_latency: list[float | None] = field(default_factory=list)
 
     @property
     def sites_ok_count(self) -> int:
         return len(self.sites_ok)
+
+    @property
+    def coverage_pct(self) -> float:
+        """Худшее покрытие обязательных сайтов по всем раундам, %.
+
+        Нода проходит только при 100% во всех раундах, поэтому для живых нод
+        это всегда 100.0 — колонка служит доказательством стабильности.
+        """
+        if not self.round_sites_ok:
+            return 100.0 * self.sites_ok_count / max(1, len(CFG.REQUIRED_SITES))
+        return 100.0 * min(self.round_sites_ok) / len(CFG.REQUIRED_SITES)
 
     @classmethod
     def from_link(cls, vl: VlessLink) -> "NodeResult":
@@ -259,16 +297,24 @@ def _env_float(name: str, default: float) -> float:
 @dataclass
 class CheckConfig:
     """Параметры тестирования прокси."""
+    # Проверка «живости» ноды идёт ТОЛЬКО по обязательным сайтам (см.
+    # REQUIRED_SITES) — раньше дополнительно опрашивались google/cloudflare/
+    # wikipedia, но на отбор они не влияли, а лишь замедляли каждый прогон
+    # (3 лишних запроса × SITE_RETRIES retries на каждую из сотен нод).
     TEST_SITES: dict[str, str] = field(default_factory=lambda: {
-        "youtube": "https://www.youtube.com/generate_204",
+        # Главная страница YouTube вместо /generate_204: эндпоинт 204 может
+        # отвечать даже когда основной контент youtube.com блокируется/не
+        # грузится. Проверка «главная реально скачивается» — как при загрузке
+        # видео; порог тела см. BODY_CHECK_MIN_BYTES.
+        "youtube": "https://www.youtube.com/",
         "telegram": "https://web.telegram.org/a/",
         # API-эндпоинт вместо тяжёлой страницы /en-us/drivers/: отвечает
         # быстро и стабильно (401 без токена = хост достижим через прокси).
         "nvidia": "https://integrate.api.nvidia.com/v1",
-        "google": "https://www.google.com/generate_204",
-        "cloudflare": "https://www.cloudflare.com/cdn-cgi/trace",
-        "wikipedia": "https://en.wikipedia.org/wiki/Main_Page",
     })
+    # Минимальный объём загруженного тела HTML-страницы, чтобы считать её
+    # реально скачиваемой (а не «пустым» ответом балансировщика).
+    BODY_CHECK_MIN_BYTES: int = 1024
     REQUIRED_SITES: tuple[str, ...] = ("youtube", "telegram", "nvidia")
     SPEED_TEST_URLS: tuple[str, ...] = (
         "https://speed.cloudflare.com/__down?bytes=25000000",   # 25 МБ
@@ -282,7 +328,35 @@ class CheckConfig:
     SPEED_TEST_TIMEOUT: float = 30.0
     MAX_CONCURRENT: int = _env_int("VF_MAX_CONCURRENT", 30)
     LATENCY_SAMPLES: int = _env_int("VF_LATENCY_SAMPLES", 3)
+
+    # --- ускорение конвейера -------------------------------------------------
+    # «Разведка» перед запуском xray: дешёвый HTTP-CONNECT до сайта через
+    # TCP-туннель ноды (без TLS и без скачивания тела). Если нода не может
+    # даже установить туннель к youtube — запускать ради неё xray, опрашивать
+    # сайты и качать тестовый файл бессмысленно. Отсевает мёртвые/заблокированные
+    # ноды за доли секунды вместо полного цикла (~минуты на медленных нодах).
+    PRECHECK_ENABLED: bool = os.environ.get("VF_PRECHECK", "1") != "0"
+    PRECHECK_HOST: str = "www.youtube.com"
+    PRECHECK_PORT: int = 443
+    PRECHECK_TIMEOUT: float = _env_float("VF_PRECHECK_TIMEOUT", 6.0)
+    # Адаптивный замер скорости: полный объём (SPEED_TEST_BYTES) качается
+    # только если по первым байтам скорость ниже FAST_THRESHOLD_MBPS — иначе
+    # быстрый результат надёжен уже на малом объёме и экономит ~10 МБ трафика
+    # и секунды на каждую из сотен живых нод.
+    ADAPTIVE_SPEED_ENABLED: bool = os.environ.get("VF_ADAPTIVE_SPEED", "1") != "0"
+    FAST_THRESHOLD_MBPS: float = 80.0
+    QUICK_DOWNLOAD_BYTES: int = 2 * 1024 * 1024
     MIN_DOWNLOAD_SPEED_MBPS: float = _env_float("VF_MIN_SPEED", 2.0)
+
+    # --- стабильность ---------------------------------------------------------
+    # Требование: покрытие 100% (все обязательные сайты) НЕ разово, а во всех
+    # раундах проверки подряд. Кратковременные «вспышки живости» (нода
+    # ответила один раз и пропала) отсекаются контрольными раундами:
+    STABILITY_ROUNDS: int = _env_int("VF_STABILITY_ROUNDS", 2)   # доп. контрольных раундов после основного
+    STABILITY_ROUND_GAP: float = _env_float("VF_STABILITY_GAP", 3.0)  # пауза между раундами, сек
+    # В финальном рейтинге скорость считается как МИНИМУМ по всем раундам
+    # (худший случай честнее среднего: «быстрая», но нестабильная нода не
+    # получит ложно-высокое место).
     TOP_N: int = _env_int("VF_TOP_N", 100)
     OUT_GOOD_FILE: str = "good_vless.txt"
     OUT_TOP_FILE: str = "best_vless.txt"
@@ -290,6 +364,10 @@ class CheckConfig:
 
 
 CFG = CheckConfig()
+
+# Сколько тела страницы читать за один проход при проверке доступности
+# (достаточно для вердикта «главная грузится», не скачиваем весь HTML).
+BODY_CHECK_READ_BYTES = 262144
 
 
 # =============================================================================
@@ -469,13 +547,30 @@ class XrayConfigError(ValueError):
     """Конфиг для xray построить нельзя (непарсящаяся ссылка и т.п.)."""
 
 
+_XRAY_VER_CACHE: tuple | None = None
+
+
+def _xray_binary_path() -> str:
+    """Путь к бинарнику xray (env XRAY_BINARY -> PATH -> ./xray_bin/xray).
+
+    Вычисляется при каждом вызове, а не на уровне модуля: раньше константа
+    XRAY_BINARY определялась в секции 6, а читалась из функции в секции 5 —
+    порядок работал лишь по случайности отложенного вызова.
+    """
+    return os.environ.get(
+        "XRAY_BINARY",
+        shutil.which("xray") or os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                             "xray_bin", "xray"),
+    )
+
+
 def _xray_version_tuple() -> tuple:
     """Версия бинарника xray, кэшируется. Пустой кортеж — определить не удалось."""
     global _XRAY_VER_CACHE
     if _XRAY_VER_CACHE is None:
         ver = ()
         try:
-            out = subprocess.run([XRAY_BINARY, "version"], capture_output=True,
+            out = subprocess.run([_xray_binary_path(), "version"], capture_output=True,
                                  text=True, timeout=10).stdout
             m = re.search(r"Xray\s+(\d+)\.(\d+)\.(\d+)", out)
             if m:
@@ -484,9 +579,6 @@ def _xray_version_tuple() -> tuple:
             pass
         _XRAY_VER_CACHE = ver
     return _XRAY_VER_CACHE
-
-
-_XRAY_VER_CACHE: tuple | None = None
 
 
 def _tls_insecure_field() -> dict:
@@ -548,9 +640,9 @@ def validate_node(vl: VlessLink) -> None:
     «мёртвая», хотя она просто не поддерживается парсером.
     """
     net = vl.network
+    # security уже резолвится через resolve_security() (в т.ч. auto -> none),
+    # поэтому здесь сравниваемся только с реально поддерживаемыми значениями
     sec = vl.security
-    if sec == "auto":
-        sec = "reality" if vl.public_key else "none"
     if sec not in SUPPORTED_SECURITY:
         raise UnsupportedNode(f"security={sec} не поддерживается")
     if net not in SUPPORTED_NETWORKS:
@@ -616,9 +708,10 @@ def build_xray_config(link_raw: str, socks_port: int) -> dict:
         vnext_user["level"] = 0
         vnext_user["flow"] = vl.flow
 
+    # vl.security уже резолвится через resolve_security() — та же логика,
+    # что и в effective_params()/дедупликации: security=auto больше не
+    # расходится между «нода считается TLS» и «тестируется как plaintext»
     sec = vl.security
-    if sec == "auto":
-        sec = "reality" if vl.public_key else "none"
     stream: dict = {"network": vl.network, "security": sec}
     if sec == "reality":
         stream["realitySettings"] = _build_reality_stream(vl)
@@ -662,11 +755,7 @@ def build_xray_config(link_raw: str, socks_port: int) -> dict:
 # =============================================================================
 # 6. МЕНЕДЖЕР ПРОЦЕССОВ XRAY  (бывш. xray_manager.py)
 # =============================================================================
-XRAY_BINARY = os.environ.get(
-    "XRAY_BINARY",
-    shutil.which("xray") or os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                                         "xray_bin", "xray"),
-)
+XRAY_BINARY = _xray_binary_path()
 
 
 def find_free_port() -> int:
@@ -751,8 +840,16 @@ async def running_xray(link_raw: str):
 # 7. СЕТЕВЫЕ ЗОНДЫ  (бывш. net_probe.py)
 # =============================================================================
 async def measure_tcp_latency(host: str, port: int, samples: int = 3) -> float | None:
-    """Сколько установок TCP-соединения до сервера ноды; возвращает медиану в мс."""
+    """Сколько установок TCP-соединения до сервера ноды; возвращает медиану в мс.
+
+    Единичный сетевой глитч больше не убивает ноду: неудачи допускаются,
+    если хотя бы часть замеров успешна (не менее MIN_SUCCESS из samples).
+    Результат возвращается только когда ни один замер не прошёл.
+    """
+    samples = max(1, samples)
+    min_success = max(1, (samples + 1) // 2)   # нужно >50% успешных замеров
     latencies: list[float] = []
+    failures = 0
     for _ in range(samples):
         t0 = time.perf_counter()
         try:
@@ -766,21 +863,49 @@ async def measure_tcp_latency(host: str, port: int, samples: int = 3) -> float |
             except Exception:
                 pass
         except (OSError, asyncio.TimeoutError):
-            return None
+            failures += 1
         await asyncio.sleep(0.05)
-    if not latencies:
+    if len(latencies) < min_success:
         return None
     latencies.sort()
     return latencies[len(latencies) // 2]
+
+
+async def precheck_tunneled_connect(proxy: str, host: str, port: int,
+                                    timeout: float) -> bool:
+    """Дешёвая «разведка» туннеля ноды ДО полноценной проверки.
+
+    Открывает SOCKS5h-туннель и шлёт HTTP/1.1 `CONNECT host:port` (без TLS и
+    без скачивания тела). Если нода не может установить туннель даже до
+    youtube.com — запускать ради неё xray-цикл с опросом сайтов и закачкой
+    тестового файла бессмысленно: это экономит десятки секунд на каждой
+    мёртвой/заблокированной ноде (а таких большинство в публичных подписках).
+
+    Возвращает True при ответе 2xx (туннель к цели проходит). Исключение —
+    любой сетевой сбой/таймаут: решение о жизни ноды тогда принимает
+    полный цикл проверки (precheck лишь ускоряет явные провалы).
+    """
+    try:
+        async with aiohttp.ClientSession(
+                connector=aiohttp.TCPConnector(ssl=False),
+                timeout=aiohttp.ClientTimeout(total=timeout)) as s:
+            async with s.request("CONNECT", f"https://{host}:{port}",
+                                 proxy=proxy) as r:
+                return 200 <= r.status < 300
+    except Exception:  # noqa: BLE001 — таймаут/обрыв = «не отсеиваем», решит полный цикл
+        return True
 
 
 async def check_site(session: aiohttp.ClientSession, proxy: str, url: str,
                      timeout: float) -> tuple[bool, float]:
     """Открывает сайт через SOCKS-прокси. Возвращает (доступен, время_сек).
 
-    Повторяет попытку при сетевых таймаутах (SITE_RETRIES раз): тяжёлые
-    страницы через медленные ноды часто не успевают за один проход, и без
-    повторов живые ноды ложно помечались мёртвыми.
+    Для HTML-страниц (youtube, telegram) успех = статус 2xx/3xx И реально
+    загруженное тело >= BODY_CHECK_MIN_BYTES байт: главная страница должна
+    скачиваться целиком, а не только «пинговаться» служебным эндпоинтом.
+    Повторяет попытку при таймаутах (SITE_RETRIES раз): тяжёлые страницы
+    через медленные ноды часто не успевают за один проход, и без повторов
+    живые ноды ложно помечались мёртвыми.
     """
     attempts = 1 + max(0, CFG.SITE_RETRIES if _is_timeout_url(url) else 2)
     t_total = 0.0
@@ -793,7 +918,21 @@ async def check_site(session: aiohttp.ClientSession, proxy: str, url: str,
 
 
 def _is_timeout_url(url: str) -> bool:
+    # «Тяжёлые» страницы (полный HTML, а не пустые 204-эндпоинты) требуют
+    # полных SITE_RETRIES повторов: через медленные ноды они не успевают
+    # за один проход.
     return "generate_204" not in url and "cdn-cgi/trace" not in url
+
+
+def _needs_body_check(url: str) -> bool:
+    """HTML-страницы проверяются «по телу»: 200 с пустым/обрезанным ответом
+    (частый случай для youtube.com на заблокированных направлениях — эндпоинт
+    /generate_204 отвечает, а контент не грузится) НЕ считается успехом —
+    главная страница должна реально скачиваться.
+    API-эндпоинты (nvidia) и служебные 204-адреса проверяются только по статусу.
+    """
+    return ("youtube.com" in url or "telegram.org" in url) and \
+           "generate_204" not in url
 
 
 async def _check_site_once(session: aiohttp.ClientSession, proxy: str, url: str,
@@ -804,54 +943,95 @@ async def _check_site_once(session: aiohttp.ClientSession, proxy: str, url: str,
         async with session.get(url, proxy=proxy,
                                timeout=aiohttp.ClientTimeout(total=timeout),
                                allow_redirects=True) as r:
+            # Белый список статусов = «хост достижим через прокси».
             ok = r.status in (200, 204, 301, 302, 307, 403) and \
                  (r.status != 403 or "cloudflare" not in url)
             if r.status >= 500:
                 ok = False
-            if not ok and r.status < 400:
-                ok = True
             # API-эндпоинты (например, integrate.api.nvidia.com/v1) отдают
             # 404/401 без корректного пути/токена — это нормальный ответ
             # сервера: TLS через прокси прошёл, хост достижим.
             if not ok and r.status in (401, 404):
                 ok = True
             if ok:
+                # Читаем тело до BODY_CHECK_READ_BYTES байт: для HTML-страниц
+                # объём ответа идёт в вердикт («главная реально грузится»),
+                # для остальных — просто прогреваем соединение.
+                body_bytes = 0
                 try:
-                    await r.content.read(65536)
+                    chunk = await r.content.read(BODY_CHECK_READ_BYTES)
+                    body_bytes = len(chunk)
                 except Exception:
-                    pass
+                    body_bytes = 0
+                if _needs_body_check(url) and r.status == 200 and \
+                        body_bytes < CFG.BODY_CHECK_MIN_BYTES:
+                    ok = False
         dt = time.perf_counter() - t0
         return ok, dt
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
         return False, time.perf_counter() - t0
 
 
+async def _download_once(session: aiohttp.ClientSession, proxy: str, url: str,
+                         max_bytes: int, timeout: float) -> tuple[float, int]:
+    """Одна закачка тестового файла; возвращает (Мбит/с, байт) по полезной нагрузке."""
+    got = 0
+    t0 = time.perf_counter()
+    try:
+        async with session.get(url, proxy=proxy,
+                               timeout=aiohttp.ClientTimeout(total=timeout),
+                               allow_redirects=True) as r:
+            if r.status != 200:
+                return 0.0, 0
+            async for chunk in r.content.iter_chunked(64 * 1024):
+                got += len(chunk)
+                if got >= max_bytes:
+                    break
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        return 0.0, got
+    dt = time.perf_counter() - t0
+    if got > 1_000_000 and dt > 0.05:      # минимум 1 МБ чтобы замер имел смысл
+        return got * 8 / dt / 1e6, got
+    return 0.0, got
+
+
 async def download_speed_test(session: aiohttp.ClientSession, proxy: str,
                               max_bytes: int, timeout: float) -> tuple[float, int]:
-    """Качает файл через прокси, возвращает (Мбит/с, байт). Только полезная нагрузка."""
+    """Качает файл через прокси, возвращает (Мбит/с, байт). Только полезная нагрузка.
+
+    Адаптивный объём (точность + скорость): сначала качается малый кусок
+    QUICK_DOWNLOAD_BYTES; если измеренная по нему скорость уже выше
+    FAST_THRESHOLD_MBPS — результат надёжен и полный объём не нужен (экономия
+    ~10 МБ трафика и секунд на каждой быстрой ноде). Медленные ноды добираются
+    до полного max_bytes — их замер остаётся таким же точным, как раньше.
+    """
     urls = list(CFG.SPEED_TEST_URLS)
     random.shuffle(urls)
     best_mbps, best_bytes = 0.0, 0
+    quick = min(max_bytes, CFG.QUICK_DOWNLOAD_BYTES)
     for url in urls:
-        got = 0
-        t0 = time.perf_counter()
-        try:
-            async with session.get(url, proxy=proxy,
-                                   timeout=aiohttp.ClientTimeout(total=timeout),
-                                   allow_redirects=True) as r:
-                if r.status != 200:
-                    continue
-                async for chunk in r.content.iter_chunked(64 * 1024):
-                    got += len(chunk)
-                    if got >= max_bytes:
-                        break
-        except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
-            continue
-        dt = time.perf_counter() - t0
-        if got > 1_000_000 and dt > 0.05:      # минимум 1 МБ чтобы замер имел смысл
-            mbps = got * 8 / dt / 1e6
-            if mbps > best_mbps:
-                best_mbps, best_bytes = mbps, got
+        target = quick if CFG.ADAPTIVE_SPEED_ENABLED else max_bytes
+        mbps, got = await _download_once(session, proxy, url, target, timeout)
+        # Приводим частичный замер (например, таймаут на середине объёма) к
+        # полному времени скачивания: иначе обрыв на последнем килобайте
+        # завышал скорость в разы и нода получала ложно-высокий рейтинг.
+        if got > 1_000_000 and mbps > 0 and got < target:
+            mbps = mbps * got / target
+        if mbps > best_mbps:
+            best_mbps, best_bytes = mbps, got
+        if (CFG.ADAPTIVE_SPEED_ENABLED and 0 < mbps < CFG.FAST_THRESHOLD_MBPS
+                and got >= target):
+            # быстрые ноды пропускают этот шаг; медленные докачивают полный
+            # объём тем же источником (сопоставимые замеры, без «перескока»
+            # между серверами разной пропускной способности). Повторный замер
+            # сам по себе адаптивный: если и он стартует медленно — прерываем
+            # закачку раньше полного объёма, время всё равно пересчитано.
+            second_target = quick if mbps < CFG.FAST_THRESHOLD_MBPS / 2 else max_bytes
+            mbps2, got2 = await _download_once(session, proxy, url, second_target, timeout)
+            if got2 > 1_000_000 and mbps2 > 0 and got2 < second_target:
+                mbps2 = mbps2 * got2 / second_target
+            if mbps2 > best_mbps:
+                best_mbps, best_bytes = mbps2, got2
         if best_mbps > 1:                       # уже нашли быстрый источник — хватит
             break
     return best_mbps, best_bytes
@@ -861,7 +1041,12 @@ async def download_speed_test(session: aiohttp.ClientSession, proxy: str,
 # 8. КОНВЕЙЕР ПРОВЕРКИ НОД  (бывш. checker.py)
 # =============================================================================
 def compute_score(res: NodeResult) -> float:
-    """Рейтинг 0..100: скорость (45%) + пинг (35%) + покрытие сайтов (20%)."""
+    """Рейтинг 0..100: скорость (45%) + пинг (35%) + отклик сайтов (20%).
+
+    Компонента «отклик» = худшее покрытие обязательных сайтов по всем раундам
+    (см. coverage_pct): стабильная живая нода даёт 100% и ранжируется по
+    скорости (минимум по раундам) и пингу.
+    """
     if not res.alive:
         return 0.0
     s = min(90.0, 20 + 25 * (res.speed_mbps ** 0.5)) if res.speed_mbps else 0.0
@@ -869,33 +1054,87 @@ def compute_score(res: NodeResult) -> float:
         p = 0.0
     else:
         p = max(0.0, min(90.0, 95 - 0.085 * res.latency_ms))
-    c = 100.0 * res.sites_ok_count / max(1, len(CFG.TEST_SITES))
+    c = res.coverage_pct
     return round(0.45 * s + 0.35 * p + 0.20 * c, 1)
+
+
+async def _run_check_round(session: aiohttp.ClientSession, proxy: str) -> dict:
+    """Один раунд проверки: все обязательные сайты + замер скорости.
+
+    Возвращает {"sites": {сайт: сек}, "speed": Мбит/с, "bytes": байт} или
+    None, если раунд упал на сетевой ошибке (не путать с «нода не открыла
+    сайт» — там sites просто неполный).
+    """
+    try:
+        tasks = {name: asyncio.create_task(
+            check_site(session, proxy, url, CFG.SITE_TIMEOUT))
+            for name, url in CFG.TEST_SITES.items()}
+        results = await asyncio.gather(*tasks.values())
+        sites = {name: dt for name, (ok, dt) in zip(tasks.keys(), results) if ok}
+        speed, nbytes = 0.0, 0
+        # Скорость меряется только если в этом раунде открыты ВСЕ обязательные
+        # сайты: качать трафик через ноду, которая уже не тянет, бессмысленно.
+        if len(sites) == len(CFG.REQUIRED_SITES):
+            speed, nbytes = await download_speed_test(
+                session, proxy, CFG.SPEED_TEST_BYTES, CFG.SPEED_TEST_TIMEOUT)
+        return {"sites": sites, "speed": speed, "bytes": nbytes}
+    except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
+        return None
 
 
 async def _probe_via_proxy(session: aiohttp.ClientSession, proxy: str,
                            res: NodeResult) -> bool:
-    """Проверяет обязательные сайты и меряет скорость; заполняет res.
+    """Проверка живости И стабильности: несколько раундов подряд через один
+    запущенный xray (экономия ~1-2 с на перезапуск процесса на каждый раунд).
 
-    Возвращает True, если нода живая (все REQUIRED_SITES доступны).
+    Живой считается только нода, которая во ВСЕХ раундах (основной +
+    STABILITY_ROUNDS контрольных, разделённых паузой STABILITY_ROUND_GAP):
+      1) открыла 100% обязательных сайтов (youtube, telegram, nvidia);
+      2) показала скорость не ниже MIN_DOWNLOAD_SPEED_MBPS.
+    Замер скорости выполняется в каждом раунде; итоговая скорость — МИНИМУМ
+    по раундам (худший случай), поэтому «вспышечные» ноды получают честный
+    рейтинг. Сбой соединения посреди раунда — тоже провал стабильности.
     """
-    tasks = {name: asyncio.create_task(
-        check_site(session, proxy, url, CFG.SITE_TIMEOUT))
-        for name, url in CFG.TEST_SITES.items()}
-    results = await asyncio.gather(*tasks.values())
-    for name, (ok, dt) in zip(tasks.keys(), results):
-        if ok:
-            res.sites_ok[name] = round(dt, 2)
+    total_rounds = 1 + max(0, int(CFG.STABILITY_ROUNDS))
+    for rnd in range(total_rounds):
+        if rnd > 0:
+            await asyncio.sleep(CFG.STABILITY_ROUND_GAP)
+        out = await _run_check_round(session, proxy)
+        if out is None:
+            res.error = f"сбой соединения в раунде {rnd + 1}/{total_rounds}"
+            return False
+        missing = [s for s in CFG.REQUIRED_SITES if s not in out["sites"]]
+        if missing:
+            if rnd == 0:
+                res.sites_ok = out["sites"]
+            res.round_sites_ok.append(len(out["sites"]))
+            res.round_speed_mbps.append(round(out["speed"], 2))
+            res.round_max_site_latency.append(
+                round(max(out["sites"].values()), 2) if out["sites"] else None)
+            res.error = (f"недоступны обязательные: {','.join(missing)} "
+                         f"(раунд {rnd + 1}/{total_rounds})")
+            return False
+        if out["speed"] < CFG.MIN_DOWNLOAD_SPEED_MBPS:
+            if rnd == 0:
+                res.sites_ok = out["sites"]
+            res.round_sites_ok.append(len(out["sites"]))
+            res.round_speed_mbps.append(round(out["speed"], 2))
+            res.round_max_site_latency.append(
+                round(max(out["sites"].values()), 2))
+            res.error = (f"скорость {out['speed']:.2f} Мбит/с ниже порога "
+                         f"{CFG.MIN_DOWNLOAD_SPEED_MBPS} (раунд {rnd + 1}/"
+                         f"{total_rounds})")
+            return False
+        if rnd == 0:
+            res.sites_ok = out["sites"]   # времена ответа основного раунда
+        res.bytes_downloaded += out["bytes"]
+        res.round_sites_ok.append(len(out["sites"]))
+        res.round_speed_mbps.append(round(out["speed"], 2))
+        res.round_max_site_latency.append(round(max(out["sites"].values()), 2))
 
-    missing_required = [s for s in CFG.REQUIRED_SITES if s not in res.sites_ok]
-    if missing_required:
-        res.error = "недоступны обязательные: " + ",".join(missing_required)
-        return False
-
-    mbps, nbytes = await download_speed_test(
-        session, proxy, CFG.SPEED_TEST_BYTES, CFG.SPEED_TEST_TIMEOUT)
-    res.speed_mbps = round(mbps, 2)
-    res.bytes_downloaded = nbytes
+    # Все раунды пройдены: покрытие 100% стабильно; скорость = худшая из
+    # замеренных (честный рейтинг); разброс виден по round_* в report.csv.
+    res.speed_mbps = round(min(res.round_speed_mbps), 2)
     res.alive = True
     return True
 
@@ -920,6 +1159,14 @@ async def check_one_node(link: str, sem: asyncio.Semaphore) -> NodeResult | None
 
         try:
             async with running_xray(vl.raw) as xp:
+                # Дешёвая разведка туннеля до тяжёлой части проверки: если
+                # нода не может установить CONNECT даже до youtube — весь
+                # цикл опроса сайтов и закачки заранее обречён.
+                if CFG.PRECHECK_ENABLED and not await precheck_tunneled_connect(
+                        xp.socks_proxy_url, CFG.PRECHECK_HOST,
+                        CFG.PRECHECK_PORT, CFG.PRECHECK_TIMEOUT):
+                    res.error = f"туннель к {CFG.PRECHECK_HOST} не проходит"
+                    return res
                 connector = aiohttp.TCPConnector(limit=8, ssl=False)
                 async with aiohttp.ClientSession(connector=connector) as session:
                     await _probe_via_proxy(session, xp.socks_proxy_url, res)
@@ -1006,16 +1253,22 @@ def save_results(results: list[NodeResult], outdir: str = ".") -> dict[str, str]
 
     with open(p_csv, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["score", "speed_Mbps", "latency_ms", "sites_ok", "country",
-                    "name", "link"])
+        w.writerow(["score", "speed_Mbps", "latency_ms", "coverage_pct",
+                    "rounds", "round_speeds_Mbps", "max_site_latency_s",
+                    "sites_ok", "country", "name", "link"])
         for r in good:
             sites = ";".join(f"{k}={v}s" for k, v in sorted(r.sites_ok.items()))
-            w.writerow([r.score, r.speed_mbps, r.latency_ms or "", sites,
-                        r.country, r.name, r.link])
+            rounds = ",".join(str(x) for x in r.round_speed_mbps)
+            spread = [x for x in r.round_max_site_latency if x is not None]
+            w.writerow([r.score, r.speed_mbps, r.latency_ms or "",
+                        f"{r.coverage_pct:.0f}", len(r.round_sites_ok),
+                        rounds, max(spread) if spread else "",
+                        sites, r.country, r.name, r.link])
 
     console.print("[bold green]Сохранено:[/]")
     console.print(f"  {p_good}: {len(good)} рабочих подписок "
-                  f"(YT+TG+NVIDIA доступны одновременно)")
+                  f"(YT+TG+NVIDIA стабильны во всех "
+                  f"{1 + max(0, int(CFG.STABILITY_ROUNDS))} раундах)")
     console.print(f"  {p_top}: топ-{len(top)} лучших по скорости/качеству")
     console.print(f"  {p_csv}: подробный отчёт")
     return paths
@@ -1029,6 +1282,7 @@ def print_table(results: list[NodeResult], n: int = 25):
     t.add_column("Score", justify="right", style="bold cyan")
     t.add_column("Скорость Мбит/с", justify="right", style="green")
     t.add_column("Пинг мс", justify="right")
+    t.add_column("Раб.", justify="center")  # раундов стабильности пройдено
     t.add_column("Стр", justify="center")
     t.add_column("Сайты", style="yellow")
     t.add_column("Нода", overflow="fold", max_width=40)
@@ -1036,6 +1290,7 @@ def print_table(results: list[NodeResult], n: int = 25):
         sites = ",".join(sorted(r.sites_ok.keys()))
         t.add_row(str(i), f"{r.score:.0f}", f"{r.speed_mbps:.1f}",
                   f"{r.latency_ms:.0f}" if r.latency_ms else "-",
+                  str(len(r.round_sites_ok)) if r.round_sites_ok else "1",
                   r.country or "?", sites, r.name or r.host)
     console.print(t)
 
@@ -1060,7 +1315,10 @@ async def install_xray(dest_dir: str | None = None) -> str:
         dest_dir = os.path.join(os.getcwd(), "xray_bin")
     os.makedirs(dest_dir, exist_ok=True)
 
-    async with aiohttp.ClientSession() as s:
+    # Таймаут обязателен: без него aiohttp ждёт тело ответа бесконечно,
+    # и один медленный/зависший зеркало-хост останавливает всю установку.
+    async with aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=120)) as s:
         async with s.get(url) as r:
             r.raise_for_status()
             data = await r.read()
@@ -1120,6 +1378,10 @@ async def amain(args) -> int:
         CFG.MIN_DOWNLOAD_SPEED_MBPS = args.min_speed
     if args.top:
         CFG.TOP_N = args.top
+    # Число контрольных раундов стабильности можно задать из CLI (0 = только
+    # основной замер, как в старых версиях).
+    if getattr(args, "stability", None) is not None:
+        CFG.STABILITY_ROUNDS = max(0, int(args.stability))
     outdir = args.out or "."
     os.makedirs(outdir, exist_ok=True)
 
@@ -1151,7 +1413,10 @@ async def amain(args) -> int:
                       "или скорость 0).[/]")
         return 3
 
-    best = [r for r in results if r.speed_mbps >= CFG.MIN_DOWNLOAD_SPEED_MBPS]
+    # Порог уже применён в _probe_via_proxy (res.alive ставится только при
+    # скорости >= MIN_DOWNLOAD_SPEED_MBPS) — здесь остаётся pass, чтобы не
+    # печатать ложную «дополнительную» фильтрацию.
+    best = results
     console.print(f"[bold]Прошли порог скорости "
                   f">= {CFG.MIN_DOWNLOAD_SPEED_MBPS} Мбит/с: {len(best)} нод[/]")
 
@@ -1175,6 +1440,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
                    help=f"сколько лучших нод сохранить (по умолчанию {CFG.TOP_N})")
     p.add_argument("--limit", type=int, default=0,
                    help="проверить только первые N найденных ссылок (0 = все)")
+    p.add_argument("--stability", type=int, default=None, metavar="N",
+                   help=f"контрольных раундов стабильности после основного "
+                        f"(по умолчанию {CFG.STABILITY_ROUNDS}; 0 = только "
+                        f"основной замер; нода проходит лишь при 100%% сайтов "
+                        f"и пороге скорости во всех раундах)")
     p.add_argument("--out", default="", help="папка для результатов (по текущей)")
     p.add_argument("--from-file", metavar="FILE",
                    help="взять подписки из локального файла вместо скачивания источников")
