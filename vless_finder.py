@@ -88,7 +88,9 @@ class VlessLink:
 
     @property
     def network(self) -> str:
-        return self.params.get("type", "tcp").lower()
+        t = self.params.get("type", "tcp").lower()
+        # alias'ы из подписок: websocket -> ws, httpupgrade остаётся как есть
+        return {"websocket": "ws"}.get(t, t)
 
     @property
     def sni(self) -> str:
@@ -121,10 +123,62 @@ class VlessLink:
             return m.group(1).upper()
         return ""
 
+    def effective_params(self) -> dict[str, str]:
+        """Параметры со значениями по умолчанию и алиасами.
+
+        Две физически одинаковые ноды, записанные с разными написаниями
+        (type=websocket vs type=ws, отсутствие security=none и т.п.),
+        дают одинаковый результат — иначе дедупликация их не схлопнет
+        и одна нода проверяется несколько раз.
+        """
+        p = dict(self.params)
+        # security может быть не указан явно, но подразумеваться по sni/fp/alpn
+        sec = p.get("security", "").lower()
+        if not sec or sec == "auto":
+            if p.get("pbk") or p.get("public-key"):
+                sec = "reality"
+            elif p.get("sni") or p.get("fp") or p.get("alpn"):
+                sec = "tls"
+            else:
+                sec = "none"
+        net = p.get("type", "tcp").lower()
+        net = {"websocket": "ws"}.get(net, net)
+        eff = {
+            "security": sec,
+            "type": net,
+            "encryption": p.get("encryption", "") or "none",
+            "path": unquote(p.get("path", "")) or "/",
+            "host": p.get("host", "").lower(),
+            "sni": p.get("sni", "").lower(),
+            "fp": p.get("fp", ""),
+            "alpn": ",".join(sorted(a for a in p.get("alpn", "").split(",") if a)),
+            "flow": p.get("flow", ""),
+            "mode": p.get("mode", ""),
+            # имена query-параметров приводятся к нижнему регистру при парсинге,
+            # поэтому обращаться надо к "servicename" (см. VlessLink.parse)
+            "serviceName": p.get("servicename", ""),
+        }
+        if sec == "reality":
+            eff["pbk"] = p.get("pbk") or p.get("public-key", "")
+            eff["sid"] = p.get("sid") or p.get("short-id", "")
+        elif sec == "tls":
+            # allowInsecure всегда принудительно включён в тестовом конфиге,
+            # поэтому на физическую идентичность ноды не влияет
+            pass
+        for k, v in p.items():
+            if k not in eff and k not in ("public-key", "short-id"):
+                eff[k] = v.strip().lower() if isinstance(v, str) else v
+        return {k: v for k, v in eff.items() if v != ""}
+
+    def dedup_key(self) -> str:
+        """Эффективный ключ дедупликации (без имени узла)."""
+        e = self.effective_params()
+        return f"{self.uuid}@{self.host.lower()}:{self.port}?" + \
+               "&".join(f"{k}={v}" for k, v in sorted(e.items()))
+
     def normalized(self) -> str:
         """Канонический вид ссылки (для дедупликации)."""
-        return f"{self.uuid}@{self.host.lower()}:{self.port}?" + \
-               "&".join(f"{k}={v}" for k, v in sorted(self.params.items()))
+        return self.dedup_key()
 
     @classmethod
     def parse(cls, link: str) -> "VlessLink | None":
@@ -208,7 +262,9 @@ class CheckConfig:
     TEST_SITES: dict[str, str] = field(default_factory=lambda: {
         "youtube": "https://www.youtube.com/generate_204",
         "telegram": "https://web.telegram.org/a/",
-        "nvidia": "https://www.nvidia.com/en-us/drivers/",
+        # API-эндпоинт вместо тяжёлой страницы /en-us/drivers/: отвечает
+        # быстро и стабильно (401 без токена = хост достижим через прокси).
+        "nvidia": "https://integrate.api.nvidia.com/v1",
         "google": "https://www.google.com/generate_204",
         "cloudflare": "https://www.cloudflare.com/cdn-cgi/trace",
         "wikipedia": "https://en.wikipedia.org/wiki/Main_Page",
@@ -220,6 +276,8 @@ class CheckConfig:
         "http://ipv4.download.thinkbroadband.com/10MB.zip",     # 10 МБ
     )
     SPEED_TEST_BYTES: int = 10 * 1024 * 1024
+    SITE_RETRIES: int = 2        # повторы при таймаутах (тяжёлые страницы типа
+                                 # web.telegram.org через медленные ноды не успевают за один проход)
     SITE_TIMEOUT: float = 15.0
     SPEED_TEST_TIMEOUT: float = 30.0
     MAX_CONCURRENT: int = _env_int("VF_MAX_CONCURRENT", 30)
@@ -237,7 +295,9 @@ CFG = CheckConfig()
 # =============================================================================
 # 3. ПАРСИНГ ПОДПИСОК  (бывш. parser.py)
 # =============================================================================
-VLESS_RE = re.compile(r"vless://[A-Za-z0-9_-]+@[^\s/?#'\"]+:\d{1,5}\?[^\s'\"<>]*", re.I)
+# Query теперь необязателен: ссылки вида vless://uuid@host:port#name раньше
+# молча терялись, потому что обязательный "\?" не совпадал.
+VLESS_RE = re.compile(r"vless://[A-Za-z0-9_-]+@[^\s/?#'\"]+:\d{1,5}(?:\?[^\s'\"<>]*)?", re.I)
 
 
 def try_b64_decode(s: str) -> str | None:
@@ -263,34 +323,42 @@ def try_b64_decode(s: str) -> str | None:
 def extract_vless_from_text(text: str) -> list[VlessLink]:
     """Вытаскивает все vless-ссылки из произвольного текста (файл подписок).
 
-    Сначала прямые ссылки; если их нет — пытается раскодировать base64-блоки
-    (весь текст или построчно). Дедупликация по VlessLink.normalized().
+    Прямые ссылки и base64-блоки (весь текст или построчно) обрабатываются
+    ВСЕГДА — раньше base64 игнорировался, если в тексте нашлась хотя бы одна
+    прямая ссылка, и часть нод молча терялась.
+    Дедупликация: сначала по каноническому виду (normalized), затем по
+    эффективному ключу (dedup_key) — физически одинаковые ноды с разными
+    написаниями параметров схлопываются в одну.
     """
     links: list[VlessLink] = []
-    seen: set[str] = set()
+    seen_norm: set[str] = set()
+    seen_eff: set[str] = set()
 
     def add(vl: VlessLink | None):
         if vl is None:
             return
         key = vl.normalized()
-        if key not in seen:
-            seen.add(key)
-            links.append(vl)
+        if key in seen_norm:
+            return
+        ekey = vl.dedup_key()
+        if ekey in seen_eff:
+            return
+        seen_norm.add(key)
+        seen_eff.add(ekey)
+        links.append(vl)
 
-    for m in VLESS_RE.finditer(text):
-        add(VlessLink.parse(m.group(0)))
+    def harvest(src: str):
+        for m in VLESS_RE.finditer(src):
+            add(VlessLink.parse(m.group(0)))
 
-    if links:
-        return links
+    harvest(text)
 
+    # base64-блоки декодируем всегда, а не только когда прямых ссылок нет
     candidates = [text] + text.splitlines()
     for cand in candidates:
         decoded = try_b64_decode(cand.strip())
         if decoded and "vless://" in decoded:
-            for m in VLESS_RE.finditer(decoded):
-                add(VlessLink.parse(m.group(0)))
-        if len(links) > 5000:
-            break
+            harvest(decoded)
     return links
 
 
@@ -338,6 +406,29 @@ def load_sources(workdir: str = ".") -> list[str]:
     return urls
 
 
+def dedup_links(raw_links: list[str]) -> list[str]:
+    """Дедупликация сырых ссылок по эффективному ключу (без имени узла).
+
+    Разные написания одной физической ноды (type=ws vs type=websocket,
+    явные/подразумеваемые security/path и т.п.) схлопываются в одну — иначе
+    лимит --limit съедают дубли и одна нода проверяется несколько раз.
+    """
+    seen_norm: set[str] = set()
+    seen_eff: set[str] = set()
+    uniq: list[str] = []
+    for l in raw_links:
+        vl = VlessLink.parse(l)
+        if vl is None:
+            continue
+        nk, ek = vl.normalized(), vl.dedup_key()
+        if nk in seen_norm or ek in seen_eff:
+            continue
+        seen_norm.add(nk)
+        seen_eff.add(ek)
+        uniq.append(vl.raw)
+    return uniq
+
+
 async def fetch_links_from_urls(urls: list[str], concurrency: int = 10) -> list[str]:
     """Скачивает все URL и извлекает из них vless:// ссылки (в т.ч. из base64)."""
     results: list[str] = []
@@ -368,13 +459,7 @@ async def fetch_links_from_urls(urls: list[str], concurrency: int = 10) -> list[
                 print(f"  [ok]   {len(links):>6} ссылок: {u}")
                 results.extend(links)
 
-    seen: set[str] = set()
-    uniq = []
-    for l in results:
-        if l not in seen:
-            seen.add(l)
-            uniq.append(l)
-    return uniq
+    return dedup_links(results)
 
 
 # =============================================================================
@@ -384,8 +469,38 @@ class XrayConfigError(ValueError):
     """Конфиг для xray построить нельзя (непарсящаяся ссылка и т.п.)."""
 
 
-def tls_fingerprint(vl: VlessLink) -> str:
-    return vl.fingerprint or "chrome"
+def _xray_version_tuple() -> tuple:
+    """Версия бинарника xray, кэшируется. Пустой кортеж — определить не удалось."""
+    global _XRAY_VER_CACHE
+    if _XRAY_VER_CACHE is None:
+        ver = ()
+        try:
+            out = subprocess.run([XRAY_BINARY, "version"], capture_output=True,
+                                 text=True, timeout=10).stdout
+            m = re.search(r"Xray\s+(\d+)\.(\d+)\.(\d+)", out)
+            if m:
+                ver = tuple(int(g) for g in m.groups())
+        except Exception:  # noqa: BLE001
+            pass
+        _XRAY_VER_CACHE = ver
+    return _XRAY_VER_CACHE
+
+
+_XRAY_VER_CACHE: tuple | None = None
+
+
+def _tls_insecure_field() -> dict:
+    """Поле отключения проверки сертификата с учётом версии xray.
+
+    В xray >= 25.12 опция allowInsecure удалена и заменена на
+    disableSystemRooting (включённая проверка только системными корнями
+    без привязки к имени) — это ближайший аналог старого allowInsecure
+    для теста публичных нод с самоподписанными/чужими сертификатами.
+    """
+    ver = _xray_version_tuple()
+    if ver and ver >= (25, 12, 0):
+        return {"disableSystemRooting": True}
+    return {"allowInsecure": True}
 
 
 def _build_tls_stream(vl: VlessLink) -> dict:
@@ -394,42 +509,93 @@ def _build_tls_stream(vl: VlessLink) -> dict:
         tls["serverName"] = vl.sni
     if vl.fingerprint:
         tls["fingerprint"] = vl.fingerprint
+    else:
+        # без uTLS-отпечатка xray использует обычный TLS (runtime бинарника),
+        # а не фолбэк "chrome", который может не совпасть с ожиданиями сервера
+        tls["fingerprint"] = ""
     if vl.alpn:
         tls["alpn"] = [a for a in vl.alpn.split(",") if a]
-    tls["allowInsecure"] = True   # тестовые ноды часто с самоподписанными cert
+    tls.update(_tls_insecure_field())   # тестовые ноды часто с самоподписанными cert
     return tls
 
 
 def _build_reality_stream(vl: VlessLink) -> dict:
-    reality = {"publicKey": vl.public_key, "fingerprint": tls_fingerprint(vl)}
+    reality: dict = {"publicKey": vl.public_key}
+    if vl.fingerprint:
+        reality["fingerprint"] = vl.fingerprint
+    else:
+        reality["fingerprint"] = ""
+    if vl.sni:
+        reality["serverName"] = vl.sni
     if vl.short_id:
         reality["shortId"] = vl.short_id
     return reality
 
 
+# потоки/безопасность, которые xray точно принимает в streamSettings
+SUPPORTED_NETWORKS = {"tcp", "ws", "grpc", "http", "xhttp"}
+SUPPORTED_SECURITY = {"none", "tls", "reality"}
+
+
+class UnsupportedNode(ValueError):
+    """Нода использует протокол/настройки, которые xray не примет."""
+
+
+def validate_node(vl: VlessLink) -> None:
+    """Отсекает заведомо неподдерживаемые ноды ДО запуска xray.
+
+    Без проверки xray падает на старте процесса и нода помечается как
+    «мёртвая», хотя она просто не поддерживается парсером.
+    """
+    net = vl.network
+    sec = vl.security
+    if sec == "auto":
+        sec = "reality" if vl.public_key else "none"
+    if sec not in SUPPORTED_SECURITY:
+        raise UnsupportedNode(f"security={sec} не поддерживается")
+    if net not in SUPPORTED_NETWORKS:
+        raise UnsupportedNode(f"type={net} не поддерживается")
+    if sec == "reality" and not vl.public_key:
+        raise UnsupportedNode("reality без pbk (публичный ключ отсутствует)")
+    if vl.flow and vl.flow not in ("", "xtls-rpb", "xtls-rprx-vision"):
+        # опечатки вида xtls-rpб (кириллица) или неизвестные flow — xray отвергнет конфиг
+        raise UnsupportedNode(f"flow={vl.flow!r} не поддерживается")
+
+
 def _build_ws_settings(vl: VlessLink) -> dict:
     ws: dict = {}
-    if vl.params.get("path"):
-        ws["path"] = vl.params["path"]
+    path = vl.params.get("path")
+    if path:
+        ws["path"] = unquote(path)
     if vl.params.get("host"):
         ws["host"] = vl.params["host"]
-    if vl.params.get("ed"):  # extra data
+    if vl.params.get("ed"):  # extra data: "<max>|Header:value&Header2:value2"
         try:
             _mx, hdrs = vl.params["ed"].split("|", 1)
-            ws["headers"] = dict([hdr.split(":", 1) for hdr in hdrs.split("&")
-                                  if ":" in hdr])
+            headers = {}
+            for hdr in unquote(hdrs).split("&"):
+                if ":" in hdr:
+                    k, v = hdr.split(":", 1)
+                    headers[k.strip()] = v.strip()
+            if headers:
+                ws["headers"] = headers
         except ValueError:
             pass
     return ws
 
 
 def _build_grpc_settings(vl: VlessLink) -> dict:
-    grpc: dict = {"serviceName": vl.params.get("serviceName",
-                                             vl.params.get("mode", ""))}
+    mode = vl.params.get("mode", "")
+    service = vl.params.get("servicename", "")
+    if not service and mode and mode != "multi":
+        # в некоторых подписках serviceName приезжает в параметре mode;
+        # значение "multi" — это режим мультиплексирования, не имя сервиса
+        service = mode
+    grpc: dict = {"serviceName": service}
     if vl.params.get("authority"):
         grpc["authority"] = vl.params["authority"]
-    if vl.params.get("mode"):
-        grpc["multiMode"] = vl.params["mode"] == "multi"
+    if mode:
+        grpc["multiMode"] = mode == "multi"
     return grpc
 
 
@@ -442,6 +608,7 @@ def build_xray_config(link_raw: str, socks_port: int) -> dict:
     vl = VlessLink.parse(link_raw)
     if vl is None:
         raise XrayConfigError("не удалось распарсить ссылку")
+    validate_node(vl)
 
     encryption = vl.params.get("encryption", "none")
     vnext_user = {"id": vl.uuid, "encryption": encryption or "none"}
@@ -449,13 +616,14 @@ def build_xray_config(link_raw: str, socks_port: int) -> dict:
         vnext_user["level"] = 0
         vnext_user["flow"] = vl.flow
 
-    stream: dict = {"network": vl.network, "security": vl.security}
-    if vl.security == "reality":
-        stream["security"] = "reality"
+    sec = vl.security
+    if sec == "auto":
+        sec = "reality" if vl.public_key else "none"
+    stream: dict = {"network": vl.network, "security": sec}
+    if sec == "reality":
         stream["realitySettings"] = _build_reality_stream(vl)
-    elif vl.security in ("tls", ""):
-        if vl.security == "tls":
-            stream["tlsSettings"] = _build_tls_stream(vl)
+    elif sec == "tls":
+        stream["tlsSettings"] = _build_tls_stream(vl)
 
     if vl.network == "ws":
         stream["wsSettings"] = _build_ws_settings(vl)
@@ -464,12 +632,12 @@ def build_xray_config(link_raw: str, socks_port: int) -> dict:
     elif vl.network == "http":
         stream["httpUpgradeSettings"] = {
             "host": vl.params.get("host", ""),
-            "path": vl.params.get("path", "/"),
+            "path": unquote(vl.params.get("path", "/")) or "/",
         }
     elif vl.network == "xhttp":
         stream["xhttpSettings"] = {
             "host": vl.params.get("host", ""),
-            "path": vl.params.get("path", "/"),
+            "path": unquote(vl.params.get("path", "/")) or "/",
             "mode": vl.params.get("mode", "auto"),
         }
 
@@ -608,7 +776,29 @@ async def measure_tcp_latency(host: str, port: int, samples: int = 3) -> float |
 
 async def check_site(session: aiohttp.ClientSession, proxy: str, url: str,
                      timeout: float) -> tuple[bool, float]:
-    """Открывает сайт через SOCKS-прокси. Возвращает (доступен, время_сек)."""
+    """Открывает сайт через SOCKS-прокси. Возвращает (доступен, время_сек).
+
+    Повторяет попытку при сетевых таймаутах (SITE_RETRIES раз): тяжёлые
+    страницы через медленные ноды часто не успевают за один проход, и без
+    повторов живые ноды ложно помечались мёртвыми.
+    """
+    attempts = 1 + max(0, CFG.SITE_RETRIES if _is_timeout_url(url) else 2)
+    t_total = 0.0
+    for attempt in range(attempts):
+        ok, dt = await _check_site_once(session, proxy, url, timeout)
+        t_total += dt
+        if ok:
+            return True, t_total
+    return False, t_total
+
+
+def _is_timeout_url(url: str) -> bool:
+    return "generate_204" not in url and "cdn-cgi/trace" not in url
+
+
+async def _check_site_once(session: aiohttp.ClientSession, proxy: str, url: str,
+                           timeout: float) -> tuple[bool, float]:
+    """Одна попытка открытия сайта через SOCKS-прокси."""
     t0 = time.perf_counter()
     try:
         async with session.get(url, proxy=proxy,
@@ -619,6 +809,11 @@ async def check_site(session: aiohttp.ClientSession, proxy: str, url: str,
             if r.status >= 500:
                 ok = False
             if not ok and r.status < 400:
+                ok = True
+            # API-эндпоинты (например, integrate.api.nvidia.com/v1) отдают
+            # 404/401 без корректного пути/токена — это нормальный ответ
+            # сервера: TLS через прокси прошёл, хост достижим.
+            if not ok and r.status in (401, 404):
                 ok = True
             if ok:
                 try:
@@ -711,6 +906,11 @@ async def check_one_node(link: str, sem: asyncio.Semaphore) -> NodeResult | None
     if vl is None:
         return None
     res = NodeResult.from_link(vl)
+    try:
+        validate_node(vl)
+    except UnsupportedNode as e:
+        res.error = f"unsupported: {e}"
+        return res
     async with sem:
         lat = await measure_tcp_latency(vl.host, vl.port, CFG.LATENCY_SAMPLES)
         if lat is None:
@@ -925,6 +1125,12 @@ async def amain(args) -> int:
 
     # ---------- фаза сбора ссылок ----------
     links = await collect_links(args, outdir)
+    # дедупликация ДО --limit: иначе лимит съедают дубли и одна физическая
+    # нода проверяется несколько раз
+    before = len(links)
+    links = dedup_links(links)
+    if before != len(links):
+        console.print(f"[dim]Дедупликация: {before} -> {len(links)} уникальных нод[/]")
     if not links:
         console.print("[red]Не найдено ни одной VLESS-подписки. "
                       "Проверьте доступность источников в KNOWN_SUBSCRIPTION_URLS.[/]")
