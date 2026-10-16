@@ -11,7 +11,10 @@
 
 Запуск:
     python vless_finder.py                 # полный прогон по всем источникам
-    python vless_finder.py --limit 500     # проверить только первые 500 нод
+    python vless_finder.py --limit 500     # проверить случайную выборку из 500 нод
+                                           # (ноды перемешиваются перед лимитом)
+    python vless_finder.py --no-shuffle    # не перемешивать: порядок как в подписках
+    python vless_finder.py --shuffle-seed 42   # воспроизводимый порядок проверки
     python vless_finder.py --install       # скачать xray, если его нет
     python vless_finder.py --from-file sub.txt   # взять ссылки из локального файла
 
@@ -19,7 +22,7 @@
     pip install aiohttp rich PySocks
 
 Переменные окружения (необязательные):
-    VF_MAX_CONCURRENT   одновременных проверок (по умолчанию 30)
+    VF_MAX_CONCURRENT   одновременных проверок (по умолчанию 100)
     VF_LATENCY_SAMPLES  число замеров TCP-пинга (3)
     VF_MIN_SPEED        минимальная скорость Мбит/с для топ-файла (2.0)
     VF_TOP_N            сколько лучших нод сохранить (100)
@@ -326,7 +329,7 @@ class CheckConfig:
                                  # web.telegram.org через медленные ноды не успевают за один проход)
     SITE_TIMEOUT: float = 15.0
     SPEED_TEST_TIMEOUT: float = 30.0
-    MAX_CONCURRENT: int = _env_int("VF_MAX_CONCURRENT", 30)
+    MAX_CONCURRENT: int = _env_int("VF_MAX_CONCURRENT", 100)
     LATENCY_SAMPLES: int = _env_int("VF_LATENCY_SAMPLES", 3)
 
     # --- ускорение конвейера -------------------------------------------------
@@ -889,7 +892,11 @@ async def precheck_tunneled_connect(proxy: str, host: str, port: int,
         async with aiohttp.ClientSession(
                 connector=aiohttp.TCPConnector(ssl=False),
                 timeout=aiohttp.ClientTimeout(total=timeout)) as s:
-            async with s.request("CONNECT", f"https://{host}:{port}",
+            # ВАЖНО: target должен быть http://host:port, а НЕ https://host:port.
+            # При https://-схеме в URL запроса aiohttp шлёт прокси TLS-рукопожатие
+            # вместо HTTP CONNECT и получает 405 Method Not Allowed — это приводило
+            # к ложному отсеиванию живых нод («туннель не проходит»).
+            async with s.request("CONNECT", f"http://{host}:{port}",
                                  proxy=proxy) as r:
                 return 200 <= r.status < 300
     except Exception:  # noqa: BLE001 — таймаут/обрыв = «не отсеиваем», решит полный цикл
@@ -1403,6 +1410,15 @@ async def amain(args) -> int:
         f.write("\n".join(links))
     console.print(f"[dim]Все найденные ссылки сохранены в {dump}[/]")
 
+    # Перемешивание ДО --limit: иначе лимит всегда съедает одни и те же
+    # первые ноды из подписок. seed (по умолчанию — текущее время) делает
+    # перемешивание воспроизводимым: тот же seed -> тот же порядок.
+    if not args.no_shuffle:
+        random.seed(args.shuffle_seed)
+        random.shuffle(links)
+        console.print(f"[dim]Порядок проверки перемешан (seed={args.shuffle_seed});"
+                      " повторите с тем же --shuffle-seed, чтобы получить тот же набор[/]")
+
     if args.limit:
         links = links[: args.limit]
 
@@ -1439,7 +1455,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument("--top", type=int, default=None,
                    help=f"сколько лучших нод сохранить (по умолчанию {CFG.TOP_N})")
     p.add_argument("--limit", type=int, default=0,
-                   help="проверить только первые N найденных ссылок (0 = все)")
+                   help="проверить только первые N ссылок (0 = все); ноды "
+                        "предварительно перемешиваются, поэтому выборка случайна")
+    p.add_argument("--no-shuffle", action="store_true",
+                   help="не перемешивать ноды: проверять строго по порядку подписок")
+    p.add_argument("--shuffle-seed", type=int, default=None, metavar="N",
+                   help="зерно перемешивания для воспроизводимого порядка "
+                        "(по умолчанию — случайное)")
     p.add_argument("--stability", type=int, default=None, metavar="N",
                    help=f"контрольных раундов стабильности после основного "
                         f"(по умолчанию {CFG.STABILITY_ROUNDS}; 0 = только "
