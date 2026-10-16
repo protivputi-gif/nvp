@@ -5,3 +5,4 @@ xray.zip
 xray_bin/
 results*/
 all_found_links.txt
+.venv/
