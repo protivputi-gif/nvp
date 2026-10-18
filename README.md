@@ -130,14 +130,28 @@ python vless_finder.py --limit 500 --no-shuffle
 `VF_STABILITY_ROUNDS`, `VF_STABILITY_GAP`, `VF_MAX_CONCURRENT`,
 а также таймауты/число потоков — см. докстринг в начале `vless_finder.py`.
 
-## Источники (KNOWN_SUBSCRIPTION_URLS)
+## Источники (файл subscriptions.txt)
+
+Список подписок больше НЕ зашит в код — он берётся из файла `subscriptions.txt`
+в рабочей папке: по одному URL на строку, пустые строки и строки с `#`
+игнорируются. Если файла нет, при первом запуске он создаётся автоматически
+с дефолтным списком живых источников. Чтобы добавить/удалить подписку —
+просто отредактируйте файл, правка кода не требуется.
+
+Порядок поиска файла: `--sources FILE` → `./subscriptions.txt` → переменная
+окружения `VF_SOURCES_FILE`. Дополнительно к списку из файла дописываются
+`known_subscriptions.txt` (в папке результатов) и `VF_EXTRA_SOURCES`
+(URL через запятую). Итоговый фактический список сохраняется в
+`subscription_urls.txt` (артефакт прогона).
+
+Текущие источники по умолчанию (все живые, проверено 2026-10-19):
 
 MatinGhanbari/v2ray-configs · mohammadaz2/v2rayConfigsForYou · Surfboardv2ray/TGParse ·
-sevcator/5ubscrpt10n · Delta-Kronecker/V2ray-Config · hamedcode/port-based-v2ray-configs ·
+Delta-Kronecker/V2ray-Config · hamedcode/port-based-v2ray-configs ·
 ninjastrikers/Nexus-nodes · MahanKenway/Freedom-V2Ray · Epodonios/v2ray-configs ·
-zieng2/wl · mheidari98/.proxy
+zieng2/wl · mheidari98/.proxy · igareck/vpn-configs-for-russia (BLACK_VLESS_RUS)
 
-Все живые (проверено 2026-10-16); мёртвые удалены.
+sevcator/5ubscrpt10n исключён: гигантская подписка (~420k нод), почти все мёртвые.
 
 ## Кодовая структура (один файл, 11 секций)
 

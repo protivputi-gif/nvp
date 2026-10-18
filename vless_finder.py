@@ -5,7 +5,7 @@
 используется), массовая проверка каждой ноды через xray и отбор лучших.
 
 Конвейер:
-    11 публичных подписок  ->  парсинг/дедупликация (в т.ч. base64)
+    подписки из subscriptions.txt  ->  парсинг/дедупликация (в т.ч. base64)
     -> TCP-пинг            ->  доступность сайтов через SOCKS5-прокси xray
     -> замер скорости      ->  скоринг               ->  good/best/report
 
@@ -17,6 +17,12 @@
     python vless_finder.py --shuffle-seed 42   # воспроизводимый порядок проверки
     python vless_finder.py --install       # скачать xray, если его нет
     python vless_finder.py --from-file sub.txt   # взять ссылки из локального файла
+    python vless_finder.py --sources my_subs.txt # список URL подписок из своего файла
+
+Список подписок НЕ зашит в код: он берётся из файла subscriptions.txt
+(один URL на строку, '#' — комментарий). Если файла нет, он создаётся
+автоматически с дефолтными живыми источниками. Редактируйте файл, чтобы
+добавлять/удалять подписки без правки кода.
 
 Зависимости: aiohttp, rich (+ PySocks для socks5h). Установить:
     pip install aiohttp rich PySocks
@@ -26,6 +32,7 @@
     VF_LATENCY_SAMPLES  число замеров TCP-пинга (3)
     VF_MIN_SPEED        минимальная скорость Мбит/с для топ-файла (2.0)
     VF_TOP_N            сколько лучших нод сохранить (100)
+    VF_SOURCES_FILE     путь к файлу подписок (если ./subscriptions.txt не найден)
     VF_EXTRA_SOURCES    доп. URL подписок через запятую
     VF_PRECHECK         0 — отключить дешёвую разведку CONNECT перед полным
                         циклом проверки (по умолчанию включена)
@@ -446,37 +453,83 @@ def extract_vless_from_text(text: str) -> list[VlessLink]:
 # =============================================================================
 # 4. ИСТОЧНИКИ ПОДПИСОК  (бывш. sources.py)
 # =============================================================================
-# Прямые URL подписок из популярных агрегаторов бесплатных прокси.
-# Список актуализирован 2026-10-16: GitHub-поиск не используется, только эти
-# прямые подписки + проверенные живые старые источники (мёртвые удалены).
-KNOWN_SUBSCRIPTION_URLS: list[str] = [
-    # --- подписки, указанные пользователем (все живые, проверено) ---
+# Подписки берутся ИЗ ФАЙЛА subscriptions.txt (один URL на строку; строки,
+# начинающиеся с '#' и пустые — игнорируются). При первом запуске, если файла
+# нет, он создаётся автоматически из DEFAULT_SUBSCRIPTION_URLS ниже.
+# Порядок поиска файла: --sources FILE -> ./subscriptions.txt -> VF_SOURCES_FILE.
+# Дополнительно: known_subscriptions.txt в рабочей папке и переменная окружения
+# VF_EXTRA_SOURCES (URL через запятую) дописываются к списку из файла.
+SOURCES_FILENAME = "subscriptions.txt"
+
+# Значения по умолчанию для первичной генерации subscriptions.txt.
+# Это НЕ жёсткий список для проверки: отредактируйте сам файл — код менять не нужно.
+# sevcator/5ubscrpt10n исключён: гигантская подписка (~420k нод), почти все мёртвые.
+DEFAULT_SUBSCRIPTION_URLS: list[str] = [
     "https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/filtered/subs/vless.txt",   # ~250 нод
     "https://raw.githubusercontent.com/mohammadaz2/v2rayConfigsForYou/main/sub/vless.txt",                          # ~350 нод
     "https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/splitted/vless",                                 # ~3600 нод
-    "https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt",                                 # очень большой (~148k строк)
     "https://github.com/Delta-Kronecker/V2ray-Config/raw/refs/heads/main/config/protocols/vless.txt",               # ~1150 нод
     "https://raw.githubusercontent.com/hamedcode/port-based-v2ray-configs/main/sub/vless.txt",                      # ~3750 нод
     "https://raw.githubusercontent.com/ninjastrikers/Nexus-nodes/main/configs/vless.txt",                           # ~350 нод
     "https://raw.githubusercontent.com/MahanKenway/Freedom-V2Ray/main/configs/vless_sub.txt",                       # ~150 нод
     "https://github.com/Epodonios/v2ray-configs/raw/main/Splitted-By-Protocol/vless.txt",                           # ~3800 нод
     "https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt",                                         # ~140 нод
-    # --- старые источники, оставлен только живой (проверено 2026-10-16) ---
     "https://raw.githubusercontent.com/mheidari98/.proxy/main/vless",                                               # ~10k нод
+    "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt",         # ~110 нод
 ]
 
 
-def load_sources(workdir: str = ".") -> list[str]:
-    """Возвращает список URL источников: встроенный список + локальный файл + env."""
-    urls = list(KNOWN_SUBSCRIPTION_URLS)
+def read_urls_file(path: str) -> list[str]:
+    """Читает файл со списком URL: по одному на строку, '#' — комментарии."""
+    urls: list[str] = []
+    with open(path, encoding="utf-8", errors="ignore") as f:
+        for line in f:
+            u = line.strip()
+            if u and not u.startswith("#") and u not in urls:
+                urls.append(u)
+    return urls
+
+
+def ensure_default_sources_file(path: str) -> None:
+    """Создаёт файл подписок с дефолтным списком, если его ещё нет."""
+    header = (
+        "# Источники VLESS-подписок (по одному URL на строку; '#' — комментарий).\n"
+        "# Этот файл — единственный источник списка подписок: редактируйте его,\n"
+        "# чтобы добавлять/удалять источники, без правки кода.\n"
+        f"# Если файла нет, он создаётся автоматически при следующем запуске.\n"
+        "# Удалённые мёртвые источники: sevcator/5ubscrpt10n (~420k нод, почти все мёртвые).\n"
+    )
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(header + "\n".join(DEFAULT_SUBSCRIPTION_URLS) + "\n")
+    console.print(f"[yellow]Файл подписок не найден — создан {path} "
+                  f"({len(DEFAULT_SUBSCRIPTION_URLS)} источников по умолчанию)[/]")
+
+
+def resolve_sources_path(workdir: str = ".", explicit: str = "") -> str:
+    """Определяет путь к файлу подписок: CLI -> workdir -> env -> cwd."""
+    if explicit:
+        return explicit
+    cand = os.path.join(workdir, SOURCES_FILENAME)
+    if os.path.isfile(cand):
+        return cand
+    env_path = os.environ.get("VF_SOURCES_FILE", "")
+    if env_path:
+        return env_path
+    return cand
+
+
+def load_sources(workdir: str = ".", sources_file: str = "") -> list[str]:
+    """Список URL источников: файл subscriptions.txt + known_subscriptions.txt + env."""
+    path = resolve_sources_path(workdir, sources_file)
+    if not os.path.isfile(path):
+        ensure_default_sources_file(path)
+    urls = read_urls_file(path)
 
     local_file = os.path.join(workdir, "known_subscriptions.txt")
     if os.path.isfile(local_file):
-        with open(local_file, encoding="utf-8", errors="ignore") as f:
-            for line in f:
-                u = line.strip()
-                if u and not u.startswith("#") and u not in urls:
-                    urls.append(u)
+        for u in read_urls_file(local_file):
+            if u not in urls:
+                urls.append(u)
 
     extra = os.environ.get("VF_EXTRA_SOURCES", "")
     for u in extra.split(","):
@@ -1065,13 +1118,20 @@ def compute_score(res: NodeResult) -> float:
     return round(0.45 * s + 0.35 * p + 0.20 * c, 1)
 
 
-async def _run_check_round(session: aiohttp.ClientSession, proxy: str) -> dict:
+async def _run_check_round(session: aiohttp.ClientSession, proxy: str,
+                           bytes_cap: int | None = None) -> dict:
     """Один раунд проверки: все обязательные сайты + замер скорости.
+
+    bytes_cap — максимальный объём скачивания для speedtest этого раунда
+    (по умолчанию CFG.SPEED_TEST_BYTES; в контрольных раундах стабильности
+    передаётся меньший кусок — полный точный замер уже сделан в основном).
 
     Возвращает {"sites": {сайт: сек}, "speed": Мбит/с, "bytes": байт} или
     None, если раунд упал на сетевой ошибке (не путать с «нода не открыла
     сайт» — там sites просто неполный).
     """
+    if bytes_cap is None:
+        bytes_cap = CFG.SPEED_TEST_BYTES
     try:
         tasks = {name: asyncio.create_task(
             check_site(session, proxy, url, CFG.SITE_TIMEOUT))
@@ -1083,7 +1143,7 @@ async def _run_check_round(session: aiohttp.ClientSession, proxy: str) -> dict:
         # сайты: качать трафик через ноду, которая уже не тянет, бессмысленно.
         if len(sites) == len(CFG.REQUIRED_SITES):
             speed, nbytes = await download_speed_test(
-                session, proxy, CFG.SPEED_TEST_BYTES, CFG.SPEED_TEST_TIMEOUT)
+                session, proxy, bytes_cap, CFG.SPEED_TEST_TIMEOUT)
         return {"sites": sites, "speed": speed, "bytes": nbytes}
     except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
         return None
@@ -1106,7 +1166,14 @@ async def _probe_via_proxy(session: aiohttp.ClientSession, proxy: str,
     for rnd in range(total_rounds):
         if rnd > 0:
             await asyncio.sleep(CFG.STABILITY_ROUND_GAP)
-        out = await _run_check_round(session, proxy)
+        # Экономия трафика/CPU в контрольных раундах: полный объём speedtest
+        # качается только в основном раунде (rnd == 0). В контрольных — малый
+        # кусок QUICK_DOWNLOAD_BYTES: их задача подтвердить доступность сайтов
+        # и отсутствие обвалов скорости, а не повторить точный замер. Порог
+        # MIN_DOWNLOAD_SPEED_MBPS на малом объёме проверяется корректно.
+        bytes_cap = (CFG.SPEED_TEST_BYTES if rnd == 0
+                     else min(CFG.SPEED_TEST_BYTES, CFG.QUICK_DOWNLOAD_BYTES))
+        out = await _run_check_round(session, proxy, bytes_cap=bytes_cap)
         if out is None:
             res.error = f"сбой соединения в раунде {rnd + 1}/{total_rounds}"
             return False
@@ -1368,11 +1435,12 @@ async def collect_links(args, outdir: str) -> list[str]:
         console.print(f"[cyan]Загружено {len(links)} подписок из {args.from_file}[/]")
         return links
 
-    urls = load_sources(outdir)
+    urls = load_sources(outdir, getattr(args, "sources", ""))
     cache_path = os.path.join(outdir, "subscription_urls.txt")
     with open(cache_path, "w") as f:
         f.write("\n".join(urls))
-    console.print(f"[cyan]Скачиваем {len(urls)} подписок (GitHub-поиск отключён)...[/]")
+    console.print(f"[cyan]Скачиваем {len(urls)} подписок из файла "
+                  f"{resolve_sources_path(outdir, getattr(args, 'sources', ''))}...[/]")
     links = await fetch_links_from_urls(urls)
     console.print(f"[green]Подписки дали {len(links)} уникальных VLESS-ссылок.[/]")
     return links
@@ -1402,7 +1470,7 @@ async def amain(args) -> int:
         console.print(f"[dim]Дедупликация: {before} -> {len(links)} уникальных нод[/]")
     if not links:
         console.print("[red]Не найдено ни одной VLESS-подписки. "
-                      "Проверьте доступность источников в KNOWN_SUBSCRIPTION_URLS.[/]")
+                      "Проверьте доступность источников в файле subscriptions.txt.[/]")
         return 1
 
     dump = os.path.join(outdir, "all_found_links.txt")
@@ -1468,6 +1536,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         f"основной замер; нода проходит лишь при 100%% сайтов "
                         f"и пороге скорости во всех раундах)")
     p.add_argument("--out", default="", help="папка для результатов (по текущей)")
+    p.add_argument("--sources", metavar="FILE", default="",
+                   help=f"файл со списком URL подписок (по одному на строку); "
+                        f"по умолчанию ./{SOURCES_FILENAME}, создаётся автоматически")
     p.add_argument("--from-file", metavar="FILE",
                    help="взять подписки из локального файла вместо скачивания источников")
     p.add_argument("--install", action="store_true",

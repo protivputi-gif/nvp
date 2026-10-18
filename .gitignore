@@ -1,8 +1,16 @@
+# кэш Python
 __pycache__/
 *.pyc
-*.log
-xray.zip
+
+# бинарь xray (скачивается через --install)
 xray_bin/
-results*/
+
+# логи и артефакты прогонов
+*.log
+test_run*/
 all_found_links.txt
-.venv/
+subscription_urls.txt
+best_vless.txt
+good_vless.txt
+report.csv
+best_vless_openclash.txt
