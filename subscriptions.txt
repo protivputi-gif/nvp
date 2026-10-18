@@ -1,7 +1,10 @@
+# Источники VLESS-подписок (по одному URL на строку; '#' — комментарий).
+# Этот файл — единственный источник списка подписок: редактируйте его,
+# чтобы добавлять/удалять источники, без правки кода.
+# Если файла нет, он создаётся автоматически при следующем запуске.
 https://raw.githubusercontent.com/MatinGhanbari/v2ray-configs/main/subscriptions/filtered/subs/vless.txt
 https://raw.githubusercontent.com/mohammadaz2/v2rayConfigsForYou/main/sub/vless.txt
 https://raw.githubusercontent.com/Surfboardv2ray/TGParse/main/splitted/vless
-https://raw.githubusercontent.com/sevcator/5ubscrpt10n/main/protocols/vl.txt
 https://github.com/Delta-Kronecker/V2ray-Config/raw/refs/heads/main/config/protocols/vless.txt
 https://raw.githubusercontent.com/hamedcode/port-based-v2ray-configs/main/sub/vless.txt
 https://raw.githubusercontent.com/ninjastrikers/Nexus-nodes/main/configs/vless.txt
@@ -9,3 +12,4 @@ https://raw.githubusercontent.com/MahanKenway/Freedom-V2Ray/main/configs/vless_s
 https://github.com/Epodonios/v2ray-configs/raw/main/Splitted-By-Protocol/vless.txt
 https://raw.githubusercontent.com/zieng2/wl/main/vless_universal.txt
 https://raw.githubusercontent.com/mheidari98/.proxy/main/vless
+https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/refs/heads/main/BLACK_VLESS_RUS.txt
